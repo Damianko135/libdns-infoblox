@@ -46,7 +46,17 @@ func (p *Provider) view() string {
 	return defaultView
 }
 
+// getConnector returns the Provider's connection to the Infoblox grid, establishing
+// and caching one on first use. The connection (and its pooled HTTP transport) is
+// reused by every subsequent call instead of being rebuilt per-request.
 func (p *Provider) getConnector() (*ibclient.Connector, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.conn != nil {
+		return p.conn, nil
+	}
+
 	if err := p.validate(); err != nil {
 		return nil, err
 	}
@@ -79,14 +89,21 @@ func (p *Provider) getConnector() (*ibclient.Connector, error) {
 		return nil, err
 	}
 
+	p.conn = conn
 	return conn, nil
 }
 
-func (p *Provider) getObjectManager() (ibclient.IBObjectManager, error) {
-	conn, err := p.getConnector()
-	if err != nil {
-		return nil, err
-	}
+// Close releases the cached connection to the Infoblox grid, if one was established.
+// It is safe to call even when no connection was ever made, and the Provider remains
+// usable afterwards — a new connection is established lazily on the next call.
+func (p *Provider) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-	return ibclient.NewObjectManager(conn, "", ""), nil
+	if p.conn == nil {
+		return nil
+	}
+	err := p.conn.Logout()
+	p.conn = nil
+	return err
 }

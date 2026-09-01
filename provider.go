@@ -5,12 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	ibclient "github.com/infobloxopen/infoblox-go-client/v2"
 	"github.com/libdns/libdns"
 )
 
 // Provider facilitates DNS record manipulation with Infoblox.
+//
+// Supported record types are CNAME, TXT, A, AAAA, MX and SRV. NS records are
+// intentionally not supported: Infoblox models them as zone-delegation metadata
+// rather than a simple name/target pair, and the client library exposes no
+// create/update/delete operations for them.
 type Provider struct {
 	Host     string `json:"host,omitempty"`
 	Port     string `json:"port,omitempty"`
@@ -22,6 +28,9 @@ type Provider struct {
 	// Insecure disables TLS certificate verification. Leave false in production;
 	// only set true against a trusted lab/test grid with a self-signed certificate.
 	Insecure bool `json:"insecure,omitempty"`
+
+	mu   sync.Mutex
+	conn *ibclient.Connector
 }
 
 // GetRecords lists all the records in the zone.
@@ -31,84 +40,57 @@ func (p *Provider) GetRecords(_ context.Context, zone string) ([]libdns.Record, 
 		return nil, fmt.Errorf("failed to get connector: %w", err)
 	}
 
+	view := p.view()
 	legitzone := strings.TrimSuffix(zone, ".")
-	qp := ibclient.NewQueryParams(false, map[string]string{"zone": legitzone, "view": p.view()})
-
-	var cnameRecords []ibclient.RecordCNAME
-	if err := conn.GetObject(&ibclient.RecordCNAME{}, "", qp, &cnameRecords); err != nil {
-		return nil, fmt.Errorf("failed to get CNAME records: %w", err)
-	}
-
-	var txtRecords []ibclient.RecordTXT
-	if err := conn.GetObject(&ibclient.RecordTXT{}, "", qp, &txtRecords); err != nil {
-		return nil, fmt.Errorf("failed to get TXT records: %w", err)
-	}
 
 	var list []libdns.Record
-	for i := range cnameRecords {
-		list = append(list, libdns.RR{
-			Type: "CNAME",
-			Name: relativeName(strVal(cnameRecords[i].Name), legitzone),
-			Data: strVal(cnameRecords[i].Canonical),
-		})
+	var errs []error
+	collect := func(recs []libdns.Record, err error) {
+		if err != nil {
+			errs = append(errs, err)
+			return
+		}
+		list = append(list, recs...)
 	}
 
-	for i := range txtRecords {
-		list = append(list, libdns.RR{
-			Type: "TXT",
-			Name: relativeName(strVal(txtRecords[i].Name), legitzone),
-			Data: strVal(txtRecords[i].Text),
-		})
-	}
+	collect(listRecordsOfKind(conn, view, legitzone, cnameKind))
+	collect(listRecordsOfKind(conn, view, legitzone, txtKind))
+	collect(listRecordsOfKind(conn, view, legitzone, aKind))
+	collect(listRecordsOfKind(conn, view, legitzone, aaaaKind))
+	collect(listRecordsOfKind(conn, view, legitzone, mxKind))
+	collect(listRecordsOfKind(conn, view, legitzone, srvKind))
 
-	return list, nil
+	return list, errors.Join(errs...)
 }
 
 // AppendRecords adds records to the zone. It returns the records that were added.
 // Records that fail to be created are reported via the returned error but do not
 // stop the remaining records from being processed.
 func (p *Provider) AppendRecords(_ context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
-	var added []libdns.Record
-	var errs []error
-
-	objMgr, err := p.getObjectManager()
+	conn, err := p.getConnector()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get object manager: %w", err)
+		return nil, fmt.Errorf("failed to get connector: %w", err)
 	}
+	objMgr := ibclient.NewObjectManager(conn, "", "")
 
 	view := p.view()
 	legitzone := strings.TrimSuffix(zone, ".")
+	groups := groupByType(records)
 
-	for _, rec := range records {
-		recRR := rec.RR()
-		fqdn := recRR.Name + "." + legitzone
-		switch recRR.Type {
-		case "CNAME":
-			record, err := objMgr.CreateCNAMERecord(view, recRR.Data, fqdn, true, uint32(recRR.TTL.Seconds()), "", nil)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("create CNAME %q: %w", fqdn, err))
-				continue
-			}
-			added = append(added, libdns.RR{
-				Type: "CNAME",
-				Name: relativeName(strVal(record.Name), legitzone),
-				Data: strVal(record.Canonical),
-			})
-		case "TXT":
-			record, err := objMgr.CreateTXTRecord(view, fqdn, recRR.Data, uint32(recRR.TTL.Seconds()), true, "", nil)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("create TXT %q: %w", fqdn, err))
-				continue
-			}
-			added = append(added, libdns.RR{
-				Type: "TXT",
-				Name: relativeName(strVal(record.Name), legitzone),
-				Data: strVal(record.Text),
-			})
-		default:
-			errs = append(errs, fmt.Errorf("unsupported record type %q for %q", recRR.Type, recRR.Name))
-		}
+	var added []libdns.Record
+	var errs []error
+	collect := func(recs []libdns.Record, errList []error) {
+		added = append(added, recs...)
+		errs = append(errs, errList...)
 	}
+
+	collect(appendRecordsOfKind(conn, objMgr, view, legitzone, groups["CNAME"], cnameKind))
+	collect(appendRecordsOfKind(conn, objMgr, view, legitzone, groups["TXT"], txtKind))
+	collect(appendRecordsOfKind(conn, objMgr, view, legitzone, groups["A"], aKind))
+	collect(appendRecordsOfKind(conn, objMgr, view, legitzone, groups["AAAA"], aaaaKind))
+	collect(appendRecordsOfKind(conn, objMgr, view, legitzone, groups["MX"], mxKind))
+	collect(appendRecordsOfKind(conn, objMgr, view, legitzone, groups["SRV"], srvKind))
+	errs = append(errs, unsupportedTypeErrors(groups)...)
 
 	return added, errors.Join(errs...)
 }
@@ -117,9 +99,6 @@ func (p *Provider) AppendRecords(_ context.Context, zone string, records []libdn
 // It returns the updated records. Records that fail are reported via the returned error but do not
 // stop the remaining records from being processed.
 func (p *Provider) SetRecords(_ context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
-	var updated []libdns.Record
-	var errs []error
-
 	conn, err := p.getConnector()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connector: %w", err)
@@ -128,59 +107,22 @@ func (p *Provider) SetRecords(_ context.Context, zone string, records []libdns.R
 
 	view := p.view()
 	legitzone := strings.TrimSuffix(zone, ".")
+	groups := groupByType(records)
 
-	for _, rec := range records {
-		recRR := rec.RR()
-		fqdn := recRR.Name + "." + legitzone
-		switch recRR.Type {
-		case "CNAME":
-			existing, found, err := findCNAMERecord(conn, view, fqdn)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("looking up CNAME %q: %w", fqdn, err))
-				continue
-			}
-
-			var record *ibclient.RecordCNAME
-			if found {
-				record, err = objMgr.UpdateCNAMERecord(existing.Ref, recRR.Data, strVal(existing.Name), boolVal(existing.UseTtl), uint32Val(existing.Ttl), strVal(existing.Comment), existing.Ea)
-			} else {
-				record, err = objMgr.CreateCNAMERecord(view, recRR.Data, fqdn, true, uint32(recRR.TTL.Seconds()), "", nil)
-			}
-			if err != nil {
-				errs = append(errs, fmt.Errorf("set CNAME %q: %w", fqdn, err))
-				continue
-			}
-			updated = append(updated, libdns.RR{
-				Type: "CNAME",
-				Name: relativeName(strVal(record.Name), legitzone),
-				Data: strVal(record.Canonical),
-			})
-		case "TXT":
-			existing, found, err := findTXTRecord(conn, view, fqdn)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("looking up TXT %q: %w", fqdn, err))
-				continue
-			}
-
-			var record *ibclient.RecordTXT
-			if found {
-				record, err = objMgr.UpdateTXTRecord(existing.Ref, strVal(existing.Name), recRR.Data, uint32Val(existing.Ttl), boolVal(existing.UseTtl), strVal(existing.Comment), existing.Ea)
-			} else {
-				record, err = objMgr.CreateTXTRecord(view, fqdn, recRR.Data, uint32(recRR.TTL.Seconds()), true, "", nil)
-			}
-			if err != nil {
-				errs = append(errs, fmt.Errorf("set TXT %q: %w", fqdn, err))
-				continue
-			}
-			updated = append(updated, libdns.RR{
-				Type: "TXT",
-				Name: relativeName(strVal(record.Name), legitzone),
-				Data: strVal(record.Text),
-			})
-		default:
-			errs = append(errs, fmt.Errorf("unsupported record type %q for %q", recRR.Type, recRR.Name))
-		}
+	var updated []libdns.Record
+	var errs []error
+	collect := func(recs []libdns.Record, errList []error) {
+		updated = append(updated, recs...)
+		errs = append(errs, errList...)
 	}
+
+	collect(setRecordsOfKind(conn, objMgr, view, legitzone, groups["CNAME"], cnameKind))
+	collect(setRecordsOfKind(conn, objMgr, view, legitzone, groups["TXT"], txtKind))
+	collect(setRecordsOfKind(conn, objMgr, view, legitzone, groups["A"], aKind))
+	collect(setRecordsOfKind(conn, objMgr, view, legitzone, groups["AAAA"], aaaaKind))
+	collect(setRecordsOfKind(conn, objMgr, view, legitzone, groups["MX"], mxKind))
+	collect(setRecordsOfKind(conn, objMgr, view, legitzone, groups["SRV"], srvKind))
+	errs = append(errs, unsupportedTypeErrors(groups)...)
 
 	return updated, errors.Join(errs...)
 }
@@ -189,94 +131,65 @@ func (p *Provider) SetRecords(_ context.Context, zone string, records []libdns.R
 // Records that fail to be deleted (including ones that no longer exist) are reported via the
 // returned error but do not stop the remaining records from being processed.
 func (p *Provider) DeleteRecords(_ context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
-	var deleted []libdns.Record
-	var errs []error
-
 	conn, err := p.getConnector()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connector: %w", err)
 	}
-	objMgr := ibclient.NewObjectManager(conn, "", "")
 
 	view := p.view()
 	legitzone := strings.TrimSuffix(zone, ".")
+	groups := groupByType(records)
 
-	for _, rec := range records {
-		recRR := rec.RR()
-		fqdn := recRR.Name + "." + legitzone
-		switch recRR.Type {
-		case "CNAME":
-			existing, found, err := findCNAMERecord(conn, view, fqdn)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("looking up CNAME %q: %w", fqdn, err))
-				continue
-			}
-			if !found {
-				errs = append(errs, fmt.Errorf("delete CNAME %q: not found", fqdn))
-				continue
-			}
-			if _, err := objMgr.DeleteCNAMERecord(existing.Ref); err != nil {
-				errs = append(errs, fmt.Errorf("delete CNAME %q: %w", fqdn, err))
-				continue
-			}
-			deleted = append(deleted, libdns.RR{
-				Type: "CNAME",
-				Name: relativeName(strVal(existing.Name), legitzone),
-				Data: strVal(existing.Canonical),
-			})
-		case "TXT":
-			existing, found, err := findTXTRecord(conn, view, fqdn)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("looking up TXT %q: %w", fqdn, err))
-				continue
-			}
-			if !found {
-				errs = append(errs, fmt.Errorf("delete TXT %q: not found", fqdn))
-				continue
-			}
-			if _, err := objMgr.DeleteTXTRecord(existing.Ref); err != nil {
-				errs = append(errs, fmt.Errorf("delete TXT %q: %w", fqdn, err))
-				continue
-			}
-			deleted = append(deleted, libdns.RR{
-				Type: "TXT",
-				Name: relativeName(strVal(existing.Name), legitzone),
-				Data: strVal(existing.Text),
-			})
-		default:
-			errs = append(errs, fmt.Errorf("unsupported record type %q for %q", recRR.Type, recRR.Name))
-		}
+	var deleted []libdns.Record
+	var errs []error
+	collect := func(recs []libdns.Record, errList []error) {
+		deleted = append(deleted, recs...)
+		errs = append(errs, errList...)
 	}
+
+	collect(deleteRecordsOfKind(conn, view, legitzone, groups["CNAME"], cnameKind))
+	collect(deleteRecordsOfKind(conn, view, legitzone, groups["TXT"], txtKind))
+	collect(deleteRecordsOfKind(conn, view, legitzone, groups["A"], aKind))
+	collect(deleteRecordsOfKind(conn, view, legitzone, groups["AAAA"], aaaaKind))
+	collect(deleteRecordsOfKind(conn, view, legitzone, groups["MX"], mxKind))
+	collect(deleteRecordsOfKind(conn, view, legitzone, groups["SRV"], srvKind))
+	errs = append(errs, unsupportedTypeErrors(groups)...)
 
 	return deleted, errors.Join(errs...)
 }
 
-// findCNAMERecord looks up a CNAME record by its fully-qualified name within a view.
-// It is used instead of objMgr.GetCNAMERecord, which also requires the record's
-// current canonical target to be known up front — unworkable for a name-based upsert.
-func findCNAMERecord(conn *ibclient.Connector, view, fqdn string) (record *ibclient.RecordCNAME, found bool, err error) {
-	var results []ibclient.RecordCNAME
-	qp := ibclient.NewQueryParams(false, map[string]string{"view": view, "name": fqdn})
-	if err := conn.GetObject(&ibclient.RecordCNAME{}, "", qp, &results); err != nil {
-		return nil, false, err
-	}
-	if len(results) == 0 {
-		return nil, false, nil
-	}
-	return &results[0], true, nil
+// supportedRecordTypes lists the libdns.RR.Type values this Provider knows how to handle.
+var supportedRecordTypes = map[string]bool{
+	"CNAME": true,
+	"TXT":   true,
+	"A":     true,
+	"AAAA":  true,
+	"MX":    true,
+	"SRV":   true,
 }
 
-// findTXTRecord looks up a TXT record by its fully-qualified name within a view.
-func findTXTRecord(conn *ibclient.Connector, view, fqdn string) (record *ibclient.RecordTXT, found bool, err error) {
-	var results []ibclient.RecordTXT
-	qp := ibclient.NewQueryParams(false, map[string]string{"view": view, "name": fqdn})
-	if err := conn.GetObject(&ibclient.RecordTXT{}, "", qp, &results); err != nil {
-		return nil, false, err
+// groupByType buckets records by their RR type so each kind can be processed together.
+func groupByType(records []libdns.Record) map[string][]libdns.RR {
+	groups := make(map[string][]libdns.RR)
+	for _, r := range records {
+		rr := r.RR()
+		groups[rr.Type] = append(groups[rr.Type], rr)
 	}
-	if len(results) == 0 {
-		return nil, false, nil
+	return groups
+}
+
+// unsupportedTypeErrors reports one error per record of a type this Provider doesn't handle.
+func unsupportedTypeErrors(groups map[string][]libdns.RR) []error {
+	var errs []error
+	for t, rrs := range groups {
+		if supportedRecordTypes[t] {
+			continue
+		}
+		for _, rr := range rrs {
+			errs = append(errs, fmt.Errorf("unsupported record type %q for %q", t, rr.Name))
+		}
 	}
-	return &results[0], true, nil
+	return errs
 }
 
 // relativeName strips the trailing zone (and separating dot) from a fully-qualified
@@ -297,13 +210,6 @@ func uint32Val(v *uint32) uint32 {
 		return 0
 	}
 	return *v
-}
-
-func boolVal(b *bool) bool {
-	if b == nil {
-		return false
-	}
-	return *b
 }
 
 // Interface guards
