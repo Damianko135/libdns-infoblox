@@ -1,0 +1,15 @@
+# Go tooling (gofmt, go vet) requires LF line endings. Force LF on checkout for
+# every text file so the repo stays gofmt-clean regardless of contributor OS.
+* text=auto eol=lf
+
+*.go   text eol=lf
+*.mod  text eol=lf
+*.sum  text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.sh   text eol=lf
+
+# Treat the example config like source, not prose.
+Caddyfile      text eol=lf
+*.Caddyfile    text eol=lf
