@@ -193,9 +193,23 @@ func unsupportedTypeErrors(groups map[string][]libdns.RR) []error {
 }
 
 // relativeName strips the trailing zone (and separating dot) from a fully-qualified
-// record name, leaving it relative the way libdns expects.
+// record name, leaving it relative the way libdns expects. A record sitting at the
+// zone apex is reported as "@", per libdns's documented convention for RR.Name.
 func relativeName(fqdn, legitzone string) string {
+	if fqdn == legitzone {
+		return "@"
+	}
 	return strings.TrimSuffix(fqdn, "."+legitzone)
+}
+
+// absoluteName is the inverse of relativeName: it qualifies a libdns record name
+// (which may be "@" or "" for the zone apex, per libdns's RR.Name convention)
+// into the fully-qualified name Infoblox expects.
+func absoluteName(name, legitzone string) string {
+	if name == "" || name == "@" {
+		return legitzone
+	}
+	return name + "." + legitzone
 }
 
 func strVal(s *string) string {

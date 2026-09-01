@@ -1,7 +1,9 @@
 package infoblox
 
 import (
+	"errors"
 	"fmt"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -31,8 +33,11 @@ type recordKind[T any] struct {
 	update func(conn *ibclient.Connector, objMgr ibclient.IBObjectManager, existing *T, fqdn string, rr libdns.RR) (*T, error)
 	// deleteRecord removes an existing record.
 	deleteRecord func(conn *ibclient.Connector, existing *T) error
-	// toRR converts a fetched record into a libdns.RR relative to the zone.
-	toRR func(rec *T, legitzone string) libdns.RR
+	// toRecord converts a fetched record into the concrete libdns record type
+	// (e.g. libdns.CNAME, libdns.Address) relative to the zone. libdns docs
+	// ask providers to return these typed structs rather than a bare
+	// libdns.RR, so callers can type-switch on the result reliably.
+	toRecord func(rec *T, legitzone string) (libdns.Record, error)
 }
 
 func listRecordsOfKind[T any](conn *ibclient.Connector, view, legitzone string, k recordKind[T]) ([]libdns.Record, error) {
@@ -40,11 +45,17 @@ func listRecordsOfKind[T any](conn *ibclient.Connector, view, legitzone string, 
 	if err != nil {
 		return nil, fmt.Errorf("failed to get %s records: %w", k.typeName, err)
 	}
-	list := make([]libdns.Record, 0, len(recs))
+	var list []libdns.Record
+	var errs []error
 	for i := range recs {
-		list = append(list, k.toRR(&recs[i], legitzone))
+		rec, err := k.toRecord(&recs[i], legitzone)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("parsing %s record: %w", k.typeName, err))
+			continue
+		}
+		list = append(list, rec)
 	}
-	return list, nil
+	return list, errors.Join(errs...)
 }
 
 func appendRecordsOfKind[T any](conn *ibclient.Connector, objMgr ibclient.IBObjectManager, view, legitzone string, rrs []libdns.RR, k recordKind[T]) ([]libdns.Record, []error) {
@@ -52,13 +63,18 @@ func appendRecordsOfKind[T any](conn *ibclient.Connector, objMgr ibclient.IBObje
 	var errs []error
 
 	for _, rr := range rrs {
-		fqdn := rr.Name + "." + legitzone
+		fqdn := absoluteName(rr.Name, legitzone)
 		rec, err := k.create(conn, objMgr, view, fqdn, rr)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("create %s %q: %w", k.typeName, fqdn, err))
 			continue
 		}
-		added = append(added, k.toRR(rec, legitzone))
+		result, err := k.toRecord(rec, legitzone)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("create %s %q: record was created but could not be parsed back: %w", k.typeName, fqdn, err))
+			continue
+		}
+		added = append(added, result)
 	}
 
 	return added, errs
@@ -69,7 +85,7 @@ func setRecordsOfKind[T any](conn *ibclient.Connector, objMgr ibclient.IBObjectM
 	var errs []error
 
 	for _, rr := range rrs {
-		fqdn := rr.Name + "." + legitzone
+		fqdn := absoluteName(rr.Name, legitzone)
 		existing, found, err := k.find(conn, view, fqdn)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("looking up %s %q: %w", k.typeName, fqdn, err))
@@ -86,7 +102,12 @@ func setRecordsOfKind[T any](conn *ibclient.Connector, objMgr ibclient.IBObjectM
 			errs = append(errs, fmt.Errorf("set %s %q: %w", k.typeName, fqdn, err))
 			continue
 		}
-		updated = append(updated, k.toRR(rec, legitzone))
+		result, err := k.toRecord(rec, legitzone)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("set %s %q: record was saved but could not be parsed back: %w", k.typeName, fqdn, err))
+			continue
+		}
+		updated = append(updated, result)
 	}
 
 	return updated, errs
@@ -97,7 +118,7 @@ func deleteRecordsOfKind[T any](conn *ibclient.Connector, view, legitzone string
 	var errs []error
 
 	for _, rr := range rrs {
-		fqdn := rr.Name + "." + legitzone
+		fqdn := absoluteName(rr.Name, legitzone)
 		existing, found, err := k.find(conn, view, fqdn)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("looking up %s %q: %w", k.typeName, fqdn, err))
@@ -111,7 +132,12 @@ func deleteRecordsOfKind[T any](conn *ibclient.Connector, view, legitzone string
 			errs = append(errs, fmt.Errorf("delete %s %q: %w", k.typeName, fqdn, err))
 			continue
 		}
-		deleted = append(deleted, k.toRR(existing, legitzone))
+		result, err := k.toRecord(existing, legitzone)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("delete %s %q: record was deleted but could not be parsed back: %w", k.typeName, fqdn, err))
+			continue
+		}
+		deleted = append(deleted, result)
 	}
 
 	return deleted, errs
@@ -181,13 +207,12 @@ var cnameKind = recordKind[ibclient.RecordCNAME]{
 		_, err := conn.DeleteObject(existing.Ref)
 		return err
 	},
-	toRR: func(rec *ibclient.RecordCNAME, legitzone string) libdns.RR {
-		return libdns.RR{
-			Type: "CNAME",
-			Name: relativeName(strVal(rec.Name), legitzone),
-			Data: strVal(rec.Canonical),
-			TTL:  ttlDuration(rec.Ttl),
-		}
+	toRecord: func(rec *ibclient.RecordCNAME, legitzone string) (libdns.Record, error) {
+		return libdns.CNAME{
+			Name:   relativeName(strVal(rec.Name), legitzone),
+			TTL:    ttlDuration(rec.Ttl),
+			Target: strVal(rec.Canonical),
+		}, nil
 	},
 }
 
@@ -211,17 +236,29 @@ var txtKind = recordKind[ibclient.RecordTXT]{
 		_, err := conn.DeleteObject(existing.Ref)
 		return err
 	},
-	toRR: func(rec *ibclient.RecordTXT, legitzone string) libdns.RR {
-		return libdns.RR{
-			Type: "TXT",
+	toRecord: func(rec *ibclient.RecordTXT, legitzone string) (libdns.Record, error) {
+		return libdns.TXT{
 			Name: relativeName(strVal(rec.Name), legitzone),
-			Data: strVal(rec.Text),
 			TTL:  ttlDuration(rec.Ttl),
-		}
+			Text: strVal(rec.Text),
+		}, nil
 	},
 }
 
-// --- A ---------------------------------------------------------------------
+// --- A / AAAA ------------------------------------------------------------
+
+// toAddress builds the shared libdns.Address type used for both A and AAAA records.
+func toAddress(name, ip string, ttl time.Duration) (libdns.Record, error) {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return nil, fmt.Errorf("invalid IP address %q: %w", ip, err)
+	}
+	return libdns.Address{
+		Name: name,
+		TTL:  ttl,
+		IP:   addr,
+	}, nil
+}
 
 var aKind = recordKind[ibclient.RecordA]{
 	typeName: "A",
@@ -241,17 +278,10 @@ var aKind = recordKind[ibclient.RecordA]{
 		_, err := conn.DeleteObject(existing.Ref)
 		return err
 	},
-	toRR: func(rec *ibclient.RecordA, legitzone string) libdns.RR {
-		return libdns.RR{
-			Type: "A",
-			Name: relativeName(strVal(rec.Name), legitzone),
-			Data: strVal(rec.Ipv4Addr),
-			TTL:  ttlDuration(rec.Ttl),
-		}
+	toRecord: func(rec *ibclient.RecordA, legitzone string) (libdns.Record, error) {
+		return toAddress(relativeName(strVal(rec.Name), legitzone), strVal(rec.Ipv4Addr), ttlDuration(rec.Ttl))
 	},
 }
-
-// --- AAAA --------------------------------------------------------------
 
 var aaaaKind = recordKind[ibclient.RecordAAAA]{
 	typeName: "AAAA",
@@ -271,13 +301,8 @@ var aaaaKind = recordKind[ibclient.RecordAAAA]{
 		_, err := conn.DeleteObject(existing.Ref)
 		return err
 	},
-	toRR: func(rec *ibclient.RecordAAAA, legitzone string) libdns.RR {
-		return libdns.RR{
-			Type: "AAAA",
-			Name: relativeName(strVal(rec.Name), legitzone),
-			Data: strVal(rec.Ipv6Addr),
-			TTL:  ttlDuration(rec.Ttl),
-		}
+	toRecord: func(rec *ibclient.RecordAAAA, legitzone string) (libdns.Record, error) {
+		return toAddress(relativeName(strVal(rec.Name), legitzone), strVal(rec.Ipv6Addr), ttlDuration(rec.Ttl))
 	},
 }
 
@@ -364,13 +389,13 @@ var mxKind = recordKind[ibclient.RecordMX]{
 		_, err := conn.DeleteObject(existing.Ref)
 		return err
 	},
-	toRR: func(rec *ibclient.RecordMX, legitzone string) libdns.RR {
-		return libdns.RR{
-			Type: "MX",
-			Name: relativeName(strVal(rec.Name), legitzone),
-			Data: formatMXData(uint32Val(rec.Preference), strVal(rec.MailExchanger)),
-			TTL:  ttlDuration(rec.Ttl),
-		}
+	toRecord: func(rec *ibclient.RecordMX, legitzone string) (libdns.Record, error) {
+		return libdns.MX{
+			Name:       relativeName(strVal(rec.Name), legitzone),
+			TTL:        ttlDuration(rec.Ttl),
+			Preference: uint16(uint32Val(rec.Preference)),
+			Target:     strVal(rec.MailExchanger),
+		}, nil
 	},
 }
 
@@ -426,12 +451,21 @@ var srvKind = recordKind[ibclient.RecordSRV]{
 		_, err := conn.DeleteObject(existing.Ref)
 		return err
 	},
-	toRR: func(rec *ibclient.RecordSRV, legitzone string) libdns.RR {
-		return libdns.RR{
+	// toRecord round-trips through libdns.RR.Parse() rather than building a
+	// libdns.SRV by hand: splitting the "_service._proto" labels back out of
+	// the record name has edge cases (e.g. no host part, root "@" name) that
+	// libdns's own parser already implements and tests.
+	toRecord: func(rec *ibclient.RecordSRV, legitzone string) (libdns.Record, error) {
+		rr := libdns.RR{
 			Type: "SRV",
 			Name: relativeName(strVal(rec.Name), legitzone),
-			Data: formatSRVData(uint32Val(rec.Priority), uint32Val(rec.Weight), uint32Val(rec.Port), strVal(rec.Target)),
 			TTL:  ttlDuration(rec.Ttl),
+			Data: formatSRVData(uint32Val(rec.Priority), uint32Val(rec.Weight), uint32Val(rec.Port), strVal(rec.Target)),
 		}
+		parsed, err := rr.Parse()
+		if err != nil {
+			return nil, fmt.Errorf("parsing SRV name %q: %w", rr.Name, err)
+		}
+		return parsed, nil
 	},
 }
