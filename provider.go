@@ -11,12 +11,21 @@ import (
 	"github.com/libdns/libdns"
 )
 
-// Provider facilitates DNS record manipulation with Infoblox.
+// Provider manages DNS records on an Infoblox NIOS grid through its WAPI.
 //
-// Supported record types are CNAME, TXT, A, AAAA, MX and SRV. NS records are
-// intentionally not supported: Infoblox models them as zone-delegation metadata
-// rather than a simple name/target pair, and the client library exposes no
-// create/update/delete operations for them.
+// The package is built for one job: letting Caddy (via libdns / certmagic)
+// solve ACME DNS-01 challenges against Infoblox, which means creating,
+// reading and removing TXT records reliably. A, AAAA, CNAME, MX and SRV
+// records are handled too, as ordinary zone-file record types with a clean
+// libdns representation, but they are not the focus and no Infoblox-specific
+// modelling (host records, IPAM, DTC, DNSSEC administration, delegation) is
+// exposed.
+//
+// NS records are intentionally not supported: Infoblox models them as
+// zone-delegation metadata (name-server glue addresses, MS delegation names)
+// rather than a simple name/target pair, and delegation management is out of
+// scope for a DNS-01 provider. Records of any other type are reported as an
+// error rather than silently ignored.
 type Provider struct {
 	Host     string `json:"host,omitempty"`
 	Port     string `json:"port,omitempty"`
@@ -34,10 +43,13 @@ type Provider struct {
 }
 
 // GetRecords lists all the records in the zone.
-func (p *Provider) GetRecords(_ context.Context, zone string) ([]libdns.Record, error) {
+func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
 	conn, err := p.getConnector()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connector: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	view := p.view()
@@ -53,23 +65,27 @@ func (p *Provider) GetRecords(_ context.Context, zone string) ([]libdns.Record, 
 		list = append(list, recs...)
 	}
 
-	collect(listRecordsOfKind(conn, view, legitzone, cnameKind))
-	collect(listRecordsOfKind(conn, view, legitzone, txtKind))
-	collect(listRecordsOfKind(conn, view, legitzone, aKind))
-	collect(listRecordsOfKind(conn, view, legitzone, aaaaKind))
-	collect(listRecordsOfKind(conn, view, legitzone, mxKind))
-	collect(listRecordsOfKind(conn, view, legitzone, srvKind))
+	collect(listRecordsOfKind(ctx, conn, view, legitzone, cnameKind))
+	collect(listRecordsOfKind(ctx, conn, view, legitzone, txtKind))
+	collect(listRecordsOfKind(ctx, conn, view, legitzone, aKind))
+	collect(listRecordsOfKind(ctx, conn, view, legitzone, aaaaKind))
+	collect(listRecordsOfKind(ctx, conn, view, legitzone, mxKind))
+	collect(listRecordsOfKind(ctx, conn, view, legitzone, srvKind))
 
 	return list, errors.Join(errs...)
 }
 
 // AppendRecords adds records to the zone. It returns the records that were added.
 // Records that fail to be created are reported via the returned error but do not
-// stop the remaining records from being processed.
-func (p *Provider) AppendRecords(_ context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
+// stop the remaining records from being processed. If an identical record already
+// exists it is treated as already added, so a retried call is idempotent.
+func (p *Provider) AppendRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	conn, err := p.getConnector()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connector: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	objMgr := ibclient.NewObjectManager(conn, "", "")
 
@@ -84,24 +100,30 @@ func (p *Provider) AppendRecords(_ context.Context, zone string, records []libdn
 		errs = append(errs, errList...)
 	}
 
-	collect(appendRecordsOfKind(conn, objMgr, view, legitzone, groups["CNAME"], cnameKind))
-	collect(appendRecordsOfKind(conn, objMgr, view, legitzone, groups["TXT"], txtKind))
-	collect(appendRecordsOfKind(conn, objMgr, view, legitzone, groups["A"], aKind))
-	collect(appendRecordsOfKind(conn, objMgr, view, legitzone, groups["AAAA"], aaaaKind))
-	collect(appendRecordsOfKind(conn, objMgr, view, legitzone, groups["MX"], mxKind))
-	collect(appendRecordsOfKind(conn, objMgr, view, legitzone, groups["SRV"], srvKind))
+	collect(appendRecordsOfKind(ctx, conn, objMgr, view, legitzone, groups["CNAME"], cnameKind))
+	collect(appendRecordsOfKind(ctx, conn, objMgr, view, legitzone, groups["TXT"], txtKind))
+	collect(appendRecordsOfKind(ctx, conn, objMgr, view, legitzone, groups["A"], aKind))
+	collect(appendRecordsOfKind(ctx, conn, objMgr, view, legitzone, groups["AAAA"], aaaaKind))
+	collect(appendRecordsOfKind(ctx, conn, objMgr, view, legitzone, groups["MX"], mxKind))
+	collect(appendRecordsOfKind(ctx, conn, objMgr, view, legitzone, groups["SRV"], srvKind))
 	errs = append(errs, unsupportedTypeErrors(groups)...)
 
 	return added, errors.Join(errs...)
 }
 
-// SetRecords sets the records in the zone, either by updating existing records or creating new ones.
-// It returns the updated records. Records that fail are reported via the returned error but do not
-// stop the remaining records from being processed.
-func (p *Provider) SetRecords(_ context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
+// SetRecords sets the records in the zone so that, for each (name, type) pair in
+// the input, the given records are the only members of that RRset — the
+// libdns.RecordSetter contract. It returns the records that were set. Records
+// that fail are reported via the returned error but do not stop the remaining
+// records from being processed. SetRecords is not atomic: on a partial failure
+// the zone may be left partway between the old and new state.
+func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	conn, err := p.getConnector()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connector: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	objMgr := ibclient.NewObjectManager(conn, "", "")
 
@@ -116,24 +138,30 @@ func (p *Provider) SetRecords(_ context.Context, zone string, records []libdns.R
 		errs = append(errs, errList...)
 	}
 
-	collect(setRecordsOfKind(conn, objMgr, view, legitzone, groups["CNAME"], cnameKind))
-	collect(setRecordsOfKind(conn, objMgr, view, legitzone, groups["TXT"], txtKind))
-	collect(setRecordsOfKind(conn, objMgr, view, legitzone, groups["A"], aKind))
-	collect(setRecordsOfKind(conn, objMgr, view, legitzone, groups["AAAA"], aaaaKind))
-	collect(setRecordsOfKind(conn, objMgr, view, legitzone, groups["MX"], mxKind))
-	collect(setRecordsOfKind(conn, objMgr, view, legitzone, groups["SRV"], srvKind))
+	collect(setRecordsOfKind(ctx, conn, objMgr, view, legitzone, groups["CNAME"], cnameKind))
+	collect(setRecordsOfKind(ctx, conn, objMgr, view, legitzone, groups["TXT"], txtKind))
+	collect(setRecordsOfKind(ctx, conn, objMgr, view, legitzone, groups["A"], aKind))
+	collect(setRecordsOfKind(ctx, conn, objMgr, view, legitzone, groups["AAAA"], aaaaKind))
+	collect(setRecordsOfKind(ctx, conn, objMgr, view, legitzone, groups["MX"], mxKind))
+	collect(setRecordsOfKind(ctx, conn, objMgr, view, legitzone, groups["SRV"], srvKind))
 	errs = append(errs, unsupportedTypeErrors(groups)...)
 
 	return updated, errors.Join(errs...)
 }
 
-// DeleteRecords deletes the records from the zone. It returns the records that were deleted.
-// Records that fail to be deleted (including ones that no longer exist) are reported via the
-// returned error but do not stop the remaining records from being processed.
-func (p *Provider) DeleteRecords(_ context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
+// DeleteRecords deletes the records from the zone. It returns the records that
+// were deleted. Following libdns.RecordDeleter semantics, an input record's
+// value and TTL must match exactly unless left empty (a wildcard), and records
+// that do not exist are silently ignored — so a repeated cleanup is safe.
+// Failures are reported via the returned error but do not stop the remaining
+// records from being processed.
+func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	conn, err := p.getConnector()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get connector: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	view := p.view()
@@ -147,12 +175,12 @@ func (p *Provider) DeleteRecords(_ context.Context, zone string, records []libdn
 		errs = append(errs, errList...)
 	}
 
-	collect(deleteRecordsOfKind(conn, view, legitzone, groups["CNAME"], cnameKind))
-	collect(deleteRecordsOfKind(conn, view, legitzone, groups["TXT"], txtKind))
-	collect(deleteRecordsOfKind(conn, view, legitzone, groups["A"], aKind))
-	collect(deleteRecordsOfKind(conn, view, legitzone, groups["AAAA"], aaaaKind))
-	collect(deleteRecordsOfKind(conn, view, legitzone, groups["MX"], mxKind))
-	collect(deleteRecordsOfKind(conn, view, legitzone, groups["SRV"], srvKind))
+	collect(deleteRecordsOfKind(ctx, conn, view, legitzone, groups["CNAME"], cnameKind))
+	collect(deleteRecordsOfKind(ctx, conn, view, legitzone, groups["TXT"], txtKind))
+	collect(deleteRecordsOfKind(ctx, conn, view, legitzone, groups["A"], aKind))
+	collect(deleteRecordsOfKind(ctx, conn, view, legitzone, groups["AAAA"], aaaaKind))
+	collect(deleteRecordsOfKind(ctx, conn, view, legitzone, groups["MX"], mxKind))
+	collect(deleteRecordsOfKind(ctx, conn, view, legitzone, groups["SRV"], srvKind))
 	errs = append(errs, unsupportedTypeErrors(groups)...)
 
 	return deleted, errors.Join(errs...)
@@ -232,4 +260,5 @@ var (
 	_ libdns.RecordAppender = (*Provider)(nil)
 	_ libdns.RecordSetter   = (*Provider)(nil)
 	_ libdns.RecordDeleter  = (*Provider)(nil)
+	_ libdns.ZoneLister     = (*Provider)(nil)
 )

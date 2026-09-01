@@ -27,8 +27,14 @@ jobs:
 
       # Patch and minor bumps only — a major bump can carry breaking changes
       # and is left as a normal PR for manual review/merge.
+      #
+      # infoblox-go-client is excluded from auto-merge at every level: the retry
+      # classifier in retry.go matches the client's HTTP-error *string* format,
+      # so even a patch bump needs a human to confirm that coupling still holds.
       - name: Auto-merge patch/minor updates once CI passes
-        if: steps.metadata.outputs.update-type == 'version-update:semver-patch' || steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        if: |
+          (steps.metadata.outputs.update-type == 'version-update:semver-patch' || steps.metadata.outputs.update-type == 'version-update:semver-minor')
+          && !contains(steps.metadata.outputs.dependency-names, 'github.com/infobloxopen/infoblox-go-client')
         run: |
           gh pr merge --auto --squash --delete-branch \
             --subject "$PR_TITLE" \
