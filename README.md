@@ -118,6 +118,12 @@ This project follows [Semantic Versioning](https://semver.org/). Until `v1.0.0`,
 - **Minor** (`0.X.y`) — new features (e.g. a new supported record type or config option), additive and backwards compatible.
 - **Major** (`X.0.0`, once ≥ `1.0.0`) — breaking API changes.
 
+### Dependabot auto-merge
+
+Patch and minor Dependabot PRs (`gomod` and `github-actions` ecosystems) are auto-merged via [`.github/workflows/dependabot-auto-merge.yml`](.github/workflows/dependabot-auto-merge.yml) once CI passes, using a squash merge whose commit message is just the PR title — no changelog dump or bot sign-off lands in history. Major-version bumps are deliberately excluded and are left as ordinary PRs for manual review, since a dependency's major bump can carry breaking changes CI alone might not catch.
+
+Note: GitHub's auto-merge only *guarantees* it waits for checks to finish when the target branch has branch protection requiring them; without that, this repo currently relies on `main`'s CI workflow completing normally before GitHub allows the merge to go through. Add a required-status-check branch protection rule on `main` (for the "Build, vet, and test" check) if you want that guarantee enforced rather than assumed.
+
 ## License
 
 [MIT](LICENSE)

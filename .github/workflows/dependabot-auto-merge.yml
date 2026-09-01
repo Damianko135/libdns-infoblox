@@ -1,0 +1,40 @@
+# This workflow uses an action that is not certified by GitHub. It is
+# provided by a third party (Dependabot's own team) and is pinned to a
+# specific commit rather than a movable tag.
+#
+# Pattern follows GitHub's documented example:
+# https://docs.github.com/en/code-security/tutorials/secure-your-dependencies/automate-dependabot-with-actions
+name: Dependabot auto-merge
+
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  dependabot:
+    runs-on: ubuntu-latest
+    # Only act on this repo's own Dependabot PRs — never on PRs from forks
+    # or other authors, even if they happen to satisfy the other checks.
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository == 'Damianko135/libdns-infoblox'
+    steps:
+      - name: Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@21025c705c08248db411dc16f3619e6b5f9ea21a # v2.5.0
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+      # Patch and minor bumps only — a major bump can carry breaking changes
+      # and is left as a normal PR for manual review/merge.
+      - name: Auto-merge patch/minor updates once CI passes
+        if: steps.metadata.outputs.update-type == 'version-update:semver-patch' || steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        run: |
+          gh pr merge --auto --squash --delete-branch \
+            --subject "$PR_TITLE" \
+            --body "" \
+            "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
