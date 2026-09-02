@@ -1,6 +1,6 @@
 # libdns-infoblox
 
-[![CI](https://github.com/Damianko135/libdns-infoblox/actions/workflows/ci.yml/badge.svg)](https://github.com/Damianko135/libdns-infoblox/actions/workflows/ci.yml)
+[![CI](https://github.com/Damianko135/libdns-infoblox/actions/workflows/ci.yml/badge.svg)](https://github.com/Damianko135/libdns-infoblox/actions/workflows/ci.yml)[![Go Reference](https://pkg.go.dev/badge/github.com/damianko135/libdns-infoblox.svg)](https://pkg.go.dev/github.com/damianko135/libdns-infoblox)
 
 An [Infoblox](https://www.infoblox.com/) NIOS WAPI provider for [libdns](https://github.com/libdns/libdns), letting Go programs (and libdns-based tools such as [Caddy](https://caddyserver.com/) / [certmagic](https://github.com/caddyserver/certmagic)) manage DNS records on an Infoblox grid.
 
