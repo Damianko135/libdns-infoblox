@@ -13,8 +13,12 @@ const (
 	defaultHTTPPoolConnections = 10
 )
 
-// validate checks that the settings required to reach the Infoblox WAPI are present.
-func (p *Provider) validate() error {
+// Validate checks that the settings required to reach the Infoblox WAPI are
+// present (Host, Username, Password and Version). It is called automatically
+// before the first connection is established, and is also exported so wrappers
+// (such as the Caddy module) can surface configuration errors at load time
+// instead of re-implementing the same field checks.
+func (p *Provider) Validate() error {
 	if p.Host == "" {
 		return errors.New("infoblox: Host is required")
 	}
@@ -57,7 +61,7 @@ func (p *Provider) getConnector() (*ibclient.Connector, error) {
 		return p.conn, nil
 	}
 
-	if err := p.validate(); err != nil {
+	if err := p.Validate(); err != nil {
 		return nil, err
 	}
 

@@ -1,6 +1,6 @@
 # libdns-infoblox
 
-[![CI](https://github.com/Damianko135/libdns-infoblox/actions/workflows/ci.yml/badge.svg)](https://github.com/Damianko135/libdns-infoblox/actions/workflows/ci.yml)
+[![CI](https://github.com/Damianko135/libdns-infoblox/actions/workflows/ci.yml/badge.svg)](https://github.com/Damianko135/libdns-infoblox/actions/workflows/ci.yml)[![Go Reference](https://pkg.go.dev/badge/github.com/damianko135/libdns-infoblox.svg)](https://pkg.go.dev/github.com/damianko135/libdns-infoblox)
 
 An [Infoblox](https://www.infoblox.com/) NIOS WAPI provider for [libdns](https://github.com/libdns/libdns), letting [Caddy](https://caddyserver.com/) / [certmagic](https://github.com/caddyserver/certmagic) (and other libdns consumers) solve **ACME DNS-01 challenges** against an Infoblox grid.
 
@@ -72,6 +72,8 @@ p := &infoblox.Provider{
 | `Insecure` | no       | `false`     | Skip TLS certificate verification. Leave `false` in production; only set `true` against a trusted lab/test grid with a self-signed certificate. |
 
 A `Provider` establishes its connection to the grid lazily on first use and reuses it (along with its pooled HTTP transport) across calls. Call `Close()` to release it explicitly, e.g. at program shutdown; this is optional and the `Provider` remains usable afterwards.
+
+`Provider.Validate()` reports missing required fields (`Host`, `Username`, `Password`, `Version`) without opening a connection. It runs automatically before the first request; call it yourself if you want to surface configuration errors earlier.
 
 ## Usage
 
