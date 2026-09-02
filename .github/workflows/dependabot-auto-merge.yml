@@ -17,7 +17,9 @@ jobs:
     runs-on: ubuntu-latest
     # Only act on this repo's own Dependabot PRs — never on PRs from forks
     # or other authors, even if they happen to satisfy the other checks.
-    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository == 'Damianko135/libdns-infoblox'
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - name: Dependabot metadata
         id: metadata
