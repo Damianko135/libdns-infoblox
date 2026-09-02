@@ -113,8 +113,11 @@ func isTransient(err error) bool {
 //
 // The client exposes no typed error for non-404 responses, so matching the
 // message is the only way to tell 429/5xx from 4xx. The dependency is pinned and
-// its bumps are reviewed, so the coupling is acceptable and contained here.
-var wapiErrStatusRe = regexp.MustCompile(`WAPI request error: (\d{3})`)
+// its bumps are reviewed (Dependabot auto-merge is disabled for it), so the
+// coupling is acceptable and contained here. The trailing "('" anchors the match
+// to that exact format so an unrelated error that merely contains a 3-digit
+// number is not mistaken for a retryable status.
+var wapiErrStatusRe = regexp.MustCompile(`WAPI request error: (\d{3})\('`)
 
 func wapiStatusCode(err error) (int, bool) {
 	if err == nil {

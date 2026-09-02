@@ -19,6 +19,7 @@ func (e fakeNetErr) Timeout() bool   { return e.timeout }
 func (e fakeNetErr) Temporary() bool { return true }
 
 func wapiErr(code int) error {
+	// Mirrors github.com/infobloxopen/infoblox-go-client/v2 getHTTPResponseError.
 	return fmt.Errorf("WAPI request error: %d('Some Status')\nContents:\n{}\n", code)
 }
 
@@ -31,6 +32,20 @@ func TestWapiStatusCode(t *testing.T) {
 	}
 	if _, ok := wapiStatusCode(nil); ok {
 		t.Errorf("nil error should not parse")
+	}
+	// A 3-digit number in unrelated text must not be read as a retryable
+	// status: the match is anchored to the client's exact "WAPI request
+	// error: NNN('" form.
+	for _, s := range []string{
+		`MX record data "WAPI request error: 500 relay": invalid preference`,
+		"dial tcp 10.0.0.5:443: connection reset by peer",
+	} {
+		if _, ok := wapiStatusCode(errors.New(s)); ok {
+			t.Errorf("wapiStatusCode(%q) matched, want no match", s)
+		}
+		if isTransient(errors.New(s)) {
+			t.Errorf("isTransient(%q) = true, want false", s)
+		}
 	}
 }
 

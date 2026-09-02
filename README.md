@@ -10,7 +10,7 @@ The primary consumer is [caddydns-infoblox](https://github.com/Damianko135/caddy
 
 ## Status
 
-This project is pre-1.0 and has **not yet been exercised against a live Infoblox grid** by its maintainers — behaviour is verified against the pinned [infoblox-go-client](https://github.com/infobloxopen/infoblox-go-client) `v2.12.0` source and covered by unit tests, but not by an end-to-end integration run. Test it against a lab/sandbox grid before trusting it in production. See [Known limitations](#known-limitations) below.
+This project is pre-1.0 and has **not yet been exercised against a live Infoblox grid** by its maintainers. Behaviour is covered by unit tests and by end-to-end tests that drive the provider through the real `infoblox-go-client` request path against an in-process fake WAPI server (`wapi_fake_test.go`), plus verification against the pinned [infoblox-go-client](https://github.com/infobloxopen/infoblox-go-client) `v2.12.0` source — but not by a run against real NIOS. Test it against a lab/sandbox grid before trusting it in production. See [Known limitations](#known-limitations) below.
 
 ## Install
 
@@ -123,14 +123,14 @@ func main() {
 
 ## Version compatibility
 
-| Component | Requirement | Notes |
-|-----------|-------------|-------|
-| `infoblox-go-client` | `v2.12.0` (pinned) | Only this version has been read/verified. The retry classifier depends on the client's error-string format; a bump should be reviewed, not auto-merged blind. |
-| `libdns` | `v1.1.1` | RRset semantics for `SetRecords`/`DeleteRecords` follow this version's interface docs. |
-| Infoblox NIOS / WAPI | any WAPI version your grid advertises, set via `Version` | The provider uses only long-established objects (`record:{a,aaaa,cname,txt,mx,srv}`, `zone_auth`), present since early WAPI 1.x/2.x. No capability that requires a recent NIOS release is used, so there is no silent-incompatibility surface — but `Version` must match a version the grid actually supports or every call fails fast. |
-| Go | `go.mod` declares `go 1.27.0` | Standard library only; no dependencies added by this provider beyond `libdns` and `infoblox-go-client`. Builds cleanly through `xcaddy`. |
+| Component | Requirement | Evidence |
+|-----------|-------------|----------|
+| `infoblox-go-client` | `v2.12.0` (pinned) | Source of this exact version read. The retry classifier matches the client's HTTP-error *string*; Dependabot auto-merge is disabled for this dependency so a bump is reviewed by a human. |
+| `libdns` | `v1.1.1` | `SetRecords`/`DeleteRecords` RRset semantics implemented from this version's interface docs; covered by unit and fake-WAPI tests. |
+| Go | `go.mod` declares `go 1.27.0` | Standard library only. Compile-time module graph unchanged by this provider: `libdns` + `infoblox-go-client` direct, the client's own `logrus`/`golang.org/x/*` indirect. No `replace` directives, no `init()`, no daemon or codegen. `go build ./...` passes; a real `xcaddy build` has **not** been run here. |
+| Infoblox NIOS / WAPI | a `Version` your grid supports | **Not verified against any NIOS release or Infoblox's WAPI schema changelog.** The provider uses only the base record objects (`record:{a,aaaa,cname,txt,mx,srv}`) and `zone_auth`, and performs **no runtime version or capability negotiation** — it assumes those objects exist. If they don't, or if `Version` names a WAPI version the grid rejects, calls fail fast with a WAPI error (verified in the client source and in tests) rather than silently producing wrong state. |
 
-None of the above has been confirmed against a live grid; see [Status](#status).
+**What "verified" means here:** every behavioural claim is backed by a Go test (unit or against an in-process fake WAPI server that exercises the real `infoblox-go-client` request path) **or** by reading the pinned dependency source. Nothing in this repository has been run against a live Infoblox grid — see [Status](#status).
 
 ## Known limitations
 
