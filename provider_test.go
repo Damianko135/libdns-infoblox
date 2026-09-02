@@ -75,7 +75,7 @@ func newValidProvider() *Provider {
 }
 
 func TestProviderValidate(t *testing.T) {
-	if err := newValidProvider().validate(); err != nil {
+	if err := newValidProvider().Validate(); err != nil {
 		t.Errorf("fully populated Provider should validate, got: %v", err)
 	}
 
@@ -93,7 +93,7 @@ func TestProviderValidate(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			p := newValidProvider()
 			c.mutate(p)
-			err := p.validate()
+			err := p.Validate()
 			if err == nil {
 				t.Fatalf("expected an error, got nil")
 			}
